@@ -156,7 +156,7 @@ python describe_states.py \
     --vlm_backend claude
 ```
 
-![W&B state_descriptions table showing per-segment captions for a browning apple clip](docs/images/wandb-descriptions.png)
+![W&B state_descriptions table showing per-segment captions for a browning apple clip](docs/images/wandb-descriptions.PNG)
 
 Reading the table:
 
