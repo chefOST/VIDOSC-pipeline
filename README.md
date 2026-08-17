@@ -1,384 +1,256 @@
-# VIDOSC-pipeline
+# What this pipeline does
 
-Video object state-change (OSC) tooling built on top of
-[facebookresearch/VidOSC](https://github.com/facebookresearch/VidOSC): feature
-extraction, standalone inference, VLM-based state description, and macOS /
-Apple Silicon support.
+A conceptual overview of the VIDOSC-pipeline project: the research problem it
+addresses, what upstream VidOSC contributes, and what this repo adds on top.
 
-**This repo contains only our own code.** Upstream VidOSC is not vendored or
-submoduled here — it is a separate clone that these scripts locate by path.
+For setup and command-line usage, see [INSTRUCTIONS.md](INSTRUCTIONS.md). This
+document is the *why*; that one is the *how*.
 
 ---
 
 ## Contents
 
-1. [What each file does](#what-each-file-does)
-2. [How the pieces fit together](#how-the-pieces-fit-together)
-3. [Setup](#setup) — clone, environment, checkpoints, data
-4. [Running the scripts](#running-the-scripts)
-5. [Things you will need to change](#things-you-will-need-to-change)
-6. [Troubleshooting](#troubleshooting)
+1. [The problem: object state changes](#the-problem-object-state-changes)
+2. [What VidOSC is](#what-vidosc-is)
+3. [What this repo adds](#what-this-repo-adds)
+4. [A worked example](#a-worked-example)
+5. [What the output is good for](#what-the-output-is-good-for)
+6. [Known limitations](#known-limitations)
 
 ---
 
-## What each file does
+## The problem: object state changes
 
-| Path | Purpose | Needs upstream clone? |
-|---|---|---|
-| [extract_features.py](extract_features.py) | Decodes a video at 1 fps and encodes each frame with CLIP ViT-L/14 → `(n_seconds, 768)` tensor | No |
-| [run_inference.py](run_inference.py) | Loads a VidOSC checkpoint, runs a forward pass on a feature file, prints a per-second state timeline, optionally logs to W&B | **Yes** (`model.FeatTimeTransformer`) |
-| [describe_states.py](describe_states.py) | Runs inference, groups the timeline into segments, captions one frame per segment with a VLM | Yes (indirectly, via `run_inference`) |
-| [vidosc_path.py](vidosc_path.py) | Locates the upstream checkout and puts it on `sys.path` | — |
-| [environment_mac.yml](environment_mac.yml) | macOS / Apple Silicon conda env (replaces upstream's Linux-only `environment.yml`) | — |
-| [patches/](patches/) | Local modifications to upstream VidOSC, kept as a diff so no upstream code lands in this repo | — |
+An **object state change** (OSC) is a transformation an object undergoes over
+time: an apple *browning*, pumpkin *roasting*, dough *rolling*. Unlike action
+recognition — which asks *what is the person doing?* — OSC modeling asks *what
+is happening to the object, and how far along is it?*
 
-Only `run_inference.py` imports upstream code, and only one symbol
-(`model.FeatTimeTransformer`). `extract_features.py` is fully standalone —
-you can run it without the clone at all.
+The task is to label every second of a video with one of four states:
 
-### How `vidosc_path.py` finds the clone
+| Label | State | Meaning |
+|:-:|---|---|
+| `0` | `background` | No part of the state change is visible |
+| `1` | `initial_state` | The object before the transformation |
+| `2` | `transitioning` | The change is actively in progress |
+| `3` | `end_state` | The object after the transformation |
 
-It resolves the checkout in this order:
+These states are **temporally ordered**. An apple cannot be browned before it is
+sliced, and it does not un-brown. Enforcing that ordering is a core part of how
+the model works — it isn't free-form per-frame classification.
 
-1. **`$VIDOSC_ROOT`**, if set — use this if your clone lives elsewhere:
-   ```bash
-   export VIDOSC_ROOT=/path/to/VidOSC
-   ```
-2. **`../VidOSC`** — a sibling of this repo (the layout [Setup](#setup) creates).
+Here is what a human-annotated ground truth looks like, for a `roasting_pumpkin`
+clip:
 
-It then verifies the directory actually contains `model.py`, `task.py`, and
-`dataset.py` before prepending it to `sys.path`. Any script needing an upstream
-module does:
+![Ground-truth OSC annotation for a roasting_pumpkin clip](docs/images/annotation-example.png)
 
-```python
-from vidosc_path import ensure_on_path
-ensure_on_path()
-from model import FeatTimeTransformer
-```
+Two things worth noticing in that timeline:
 
-Check the resolved path at any time — this is the fastest way to confirm your
-setup is correct:
-
-```bash
-python vidosc_path.py     # prints the checkout it would use, or explains what's missing
-```
+- **States occupy contiguous spans, not isolated frames.** The initial state runs
+  roughly 0–13s, transitioning is a brief band around 13–15s, and the end state
+  appears later. The transition is often the *shortest* of the three, which makes
+  it the hardest to localize.
+- **A state can appear in more than one span**, and the gaps between spans are
+  `background` — moments where the camera cuts away, the object is off-screen, or
+  what's visible doesn't clearly belong to any stage.
 
 ---
 
-## How the pieces fit together
+## What VidOSC is
 
-```
-  your_video.mp4
-        │
-        ├─────────────────────────────┐
-        │                             │
-        ▼  extract_features.py        │  (raw frames, re-decoded at 1 fps)
-  data/feats/<id>.pth.tar             │
-  (n_seconds, 768) float tensor       │
-        │                             │
-        ▼  run_inference.py           │
-  per-second state predictions ───────┤
-  (n_seconds,) ints in 0..3           │
-        │                             ▼
-        └──────────────────►  describe_states.py
-                                      │
-                                      ▼
-                             one caption per state segment
-```
+[**Learning Object State Changes in Videos: An Open-World Perspective**](https://arxiv.org/abs/2312.11782)
+Zihui Xue, Kumar Ashutosh, Kristen Grauman — CVPR 2024
+[project page](https://vision.cs.utexas.edu/projects/VidOSC/) ·
+[code](https://github.com/facebookresearch/VidOSC)
 
-**States:** `0 = background`, `1 = initial_state`, `2 = transitioning`,
-`3 = end_state`.
+VidOSC is the model and dataset released with that paper. Its central claim is
+about the **open world**: prior OSC work trained one model per state change from
+a small fixed vocabulary, so it could never handle a transformation it hadn't
+seen. VidOSC learns representations that generalize to *novel* OSCs — object and
+transformation combinations absent from training.
 
-The model is a small transformer over the per-second feature sequence. It sees
-the whole clip at once, so predictions at second *t* depend on the entire video,
-not just that frame.
+### The dataset: HowToChange
 
----
+- **Evaluation:** 5,423 human-annotated video clips from HowTo100M, covering
+  **409 OSCs** — 20 state transitions across 134 objects.
+- **Training:** 36,075 clips mined automatically, with no manual labels. Candidate
+  clips are found via ASR transcripts and LLAMA2, then pseudo-labeled with
+  CLIP/VideoCLIP.
 
-## Setup
+Seen/novel splits live in the upstream `data_files/osc_split.csv`, which is what
+makes the open-world evaluation possible.
 
-### 1. Clone upstream VidOSC as a sibling directory
+### The model
 
-Pinned commit: **`59575773c97878ea30a0228f28ab00a3ee2f1ea2`**
-(`code for ChangeIt and ChangeIt (open-world)`, 2024-09-09)
+Small and deliberately so. Per-second visual features are fed to a transformer
+(`FeatTimeTransformer` — 3 layers, 4 heads, width 512) that classifies each
+second into the four states. Two design details matter:
 
-From the parent directory of this repo:
+- **It sees the whole clip at once.** The prediction at second *t* depends on
+  every other second, not just frame *t*. This is what lets it infer "this must
+  be the end state, because the transition already happened."
+- **Ordering is enforced at decode time**, not learned implicitly. Upstream uses
+  a CUDA kernel (`lookforthechange`) for this; the patches in this repo add a
+  pure-PyTorch dynamic program that does the same job for an arbitrary number of
+  states. See [patches/README.md](patches/README.md).
 
-```bash
-git clone https://github.com/facebookresearch/VidOSC.git VidOSC
-git -C VidOSC checkout 59575773c97878ea30a0228f28ab00a3ee2f1ea2
-git -C VidOSC apply "$PWD/VIDOSC-pipeline/patches/"*.patch
-```
-
-Resulting layout:
-
-```
-WAT.AI/                 # Parent Folder Name
-├── VidOSC/             # upstream clone, untracked by this repo
-└── VIDOSC-pipeline/    # this repo
-```
-
-The patches are what make upstream run on macOS at all (the causal-ordering
-constraint is a Linux-only compiled CUDA extension) and what generalize it to
-N transitioning states. See [patches/README.md](patches/README.md) for the full
-rationale, plus how to check, reverse, and regenerate them.
-
-> Don't clone VidOSC *inside* this repo — `vidosc_path.py` looks for a sibling.
-> (`.gitignore` does ignore `/VidOSC/` as a safety net, but you'd still need to
-> set `$VIDOSC_ROOT` for it to resolve.)
-
-### 2. Create the conda environment
-
-```bash
-conda env create -f environment_mac.yml
-conda activate vidosc_mac
-brew install ffmpeg
-```
-
-`ffmpeg` is a real system binary, not just the `ffmpeg-python` wrapper —
-`extract_features.py` shells out to it for decoding.
-
-**Optional extras**, deliberately kept out of the env file so the base install
-stays small. Each is imported lazily and raises a clear message if missing:
-
-| Install | Needed for |
-|---|---|
-| `pip install wandb` | `--wandb` logging in either script |
-| `pip install matplotlib` | the timeline image in W&B runs (silently skipped if absent) |
-| `pip install anthropic` | `describe_states.py --vlm_backend claude` |
-| `pip install openai` | `describe_states.py --vlm_backend openai` |
-| `pip install transformers accelerate` | `describe_states.py --vlm_backend llava` |
-
-### 3. Download a checkpoint
-
-Checkpoints (~127 MB each) are not in git. Download from the
-[VidOSC Google Drive](https://drive.google.com/drive/folders/1tChqwGmfmBWUq0KGFaru2wPB_4Q2hiYP)
-and place under `checkpoints/` (gitignored):
-
-```
-checkpoints/chopping.ckpt
-```
-
-`run_inference.py` reads `input_dim` and `vocab_size` straight off the
-checkpoint weights, so you never pass architecture flags — but see the
-[object-centric features](#object-centric-features-important) note below,
-because it determines what features the checkpoint actually expects.
-
-### 4. Get features
-
-Either extract your own (see [extract_features.py](#extract_featurespy)) or
-download the pre-extracted InternVideo features from the same Google Drive.
-The pre-extracted set is organized per OSC category:
-
-```
-data/feats_handobj/<osc>/<video_id>_st<start>_dur<duration>_obj.pth.tar
-data/feats_handobj/<osc>/<video_id>_st<start>_dur<duration>_obj.npy
-data/eval_clips/<osc>/<video_id>_st<start>_dur<duration>.mp4
-```
-
-where `<osc>` is `<verb>_<object>`, e.g. `browning_apple`. That naming matters:
-`describe_states.py` derives the object name for its prompt from the parent
-directory, and `run_inference.py` finds the `.npy` index by swapping the
-`.pth.tar` suffix.
-
-### Object-centric features (important)
-
-All three released checkpoints (`browning`, `chopping`, `rolling`) were trained
-with `det=1` — they expect **1536-dim** input: 768 dims of whole-frame features
-concatenated with 768 dims of object-centric (hand–object detector) features.
-
-`extract_features.py` produces only the 768-dim whole-frame half. When you feed
-that to a 1536-dim checkpoint, `run_inference.py` zero-pads the missing half and
-prints:
-
-```
-Warning: checkpoint expects object-centric features (det=1) but none were
-provided; padding with zeros (results may be degraded).
-```
-
-This runs and produces plausible output, but it is **not** a faithful
-reproduction of the paper's numbers. For that, use the pre-extracted
-`feats_handobj` features and pass both halves:
-
-```bash
-python run_inference.py \
-    --feat  data/feats/pof9jFBhHVA.pth.tar \
-    --obj_feat data/feats_handobj/browning_apple/pof9jFBhHVA_st13.0_dur40.0_obj.pth.tar \
-    --ckpt  checkpoints/browning.ckpt
-```
-
-The accompanying `_obj.npy` file (same path, `.pth.tar` → `.npy`) holds the
-second-indices the object features correspond to — frames where the detector
-found nothing stay zero. It's picked up automatically if present.
+The heavy lifting is in the *features*, not the classifier. VidOSC uses
+InternVideo-MM-L14 embeddings, optionally concatenated with object-centric
+features from a hand–object detector — which is why the released checkpoints
+expect 1536-dim input rather than 768.
 
 ---
 
-## Running the scripts
+## What this repo adds
 
-### `extract_features.py`
+Upstream VidOSC is research code: it assumes Linux with CUDA, and it evaluates
+over a CSV-driven dataset. Four additions make it usable as a pipeline.
 
-Decodes at 1 fps, resizes to 224×224, encodes each frame with CLIP ViT-L/14,
-L2-normalizes, and stacks.
+### 1. It runs on Apple Silicon
 
-```bash
-python extract_features.py \
-    --video /path/to/your_video.mp4 \
-    --video_id your_video_id
-```
+Upstream cannot even be imported on macOS — `task.py` imports a compiled CUDA
+extension at module scope, and the pinned conda environment is Linux-only down to
+the build strings. The [patches/](patches/) directory fixes both, so a MacBook is
+a working dev environment instead of requiring a remote GPU box.
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `--video` | *required* | Input `.mp4` |
-| `--video_id` | *required* | Used as the output filename stem |
-| `--feat_dir` | `./data/feats` | Output directory (created if needed) |
+### 2. Inference on a single video, without the dataset
 
-Writes `data/feats/your_video_id.pth.tar`. Device is auto-selected: MPS → CUDA →
-CPU.
+Upstream runs evaluation over annotated CSV splits.
+[run_inference.py](run_inference.py) takes one feature file and one checkpoint
+and prints a timeline — no annotations, no dataset plumbing. It reads the model
+architecture straight off the checkpoint weights, so there are no config flags to
+get wrong.
 
-> **Backbone caveat:** VidOSC was trained on InternVideo-MM-L14 features. This
-> script uses CLIP ViT-L/14 (same architecture family, same 768-dim output) as a
-> stand-in, so results are approximate. This is a *separate* approximation from
-> the object-centric one above — using this script alone, you're off on both axes.
+### 3. Feature extraction from arbitrary video
 
-### `run_inference.py`
+[extract_features.py](extract_features.py) decodes any `.mp4` at 1 fps and
+encodes each frame with CLIP ViT-L/14, so you can point the pipeline at your own
+footage rather than only the pre-extracted HowToChange features. (This is an
+approximation — see [limitations](#known-limitations).)
 
-```bash
-python run_inference.py \
-    --feat data/feats/your_video_id.pth.tar \
-    --ckpt checkpoints/chopping.ckpt
-```
+### 4. Descriptions, not just labels
 
-Prints a per-second timeline, then a summary:
+This is the substantive addition. VidOSC tells you **when** a state change
+happens; it does not tell you **what the object looks like**. Its entire output
+vocabulary is four integers.
 
-```
-t=  0s  [████████████████████]  initial_state  (0.97)
-t= 13s  [▒▒▒▒▒▒▒▒▒▒▒▒▒▒      ]  transitioning  (0.71)
-t= 46s  [░░░░░░░░░░░░░░░░░░░░]  end_state      (0.94)
-```
+[describe_states.py](describe_states.py) closes that gap. It runs inference,
+groups consecutive seconds sharing a state into segments, and sends one
+representative frame per segment to a vision-language model with an
+object-specific prompt. The result is a timeline annotated in natural language:
+not just "seconds 23–39 are `transitioning`", but "sliced, pale, enzymatically
+browning at edges."
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `--feat` | *required* | `.pth.tar` feature file |
-| `--ckpt` | *required* | VidOSC `.ckpt` |
-| `--obj_feat` | `None` | Object-centric features for `det=1` checkpoints |
-| `--wandb` | **on if `WANDB_API_KEY` is set** | Log to Weights & Biases |
-| `--no-wandb` | off | Force W&B off, overriding the above |
-| `--wandb-entity` | `m22jeon-university-of-waterloo` | See [below](#things-you-will-need-to-change) |
-| `--wandb-project` | `ChefOST` | W&B project |
-| `--wandb-run-name` | auto | Defaults to `vidosc-<ckpt>-<video_id>` |
+---
 
-It's also importable, which is how `describe_states.py` uses it:
+## A worked example
 
-```python
-from run_inference import run_inference
-predicted, probs = run_inference(feat_path, ckpt_path, use_wandb=False)
-```
-
-With `--wandb` it logs a per-second predictions table, a state-duration bar
-chart, a color-coded timeline image, and `seconds/<state>` + `pct/<state>`
-summary metrics.
-
-### `describe_states.py`
-
-Runs inference, groups consecutive seconds sharing a state into segments, and
-sends the middle frame of each segment to a VLM asking what the object looks
-like at that moment.
+Running `describe_states.py` on a `browning_apple` clip with the Claude backend,
+logged to Weights & Biases:
 
 ```bash
 python describe_states.py \
     --video data/eval_clips/browning_apple/pof9jFBhHVA_st13.0_dur40.0.mp4 \
-    --feat data/feats/your_video_id.pth.tar \
-    --ckpt checkpoints/browning.ckpt \
+    --feat  data/feats/pof9jFBhHVA_browning_apple_real.pth.tar \
+    --ckpt  checkpoints/browning.ckpt \
     --vlm_backend claude
 ```
 
-`--video` must be the same clip `--feat` was extracted from. If the frame count
-and prediction count disagree, both are truncated to the shorter one and you get
-a warning.
+![W&B state_descriptions table showing per-segment captions for a browning apple clip](docs/images/wandb-descriptions.png)
 
-| Flag | Default | Meaning |
+Reading the table:
+
+| Segment | State | Description |
 |---|---|---|
-| `--video` | *required* | Source clip, re-decoded at 1 fps for the frames |
-| `--feat`, `--ckpt`, `--obj_feat` | | Same as `run_inference.py` |
-| `--object` | auto | Object name for the prompt, e.g. `apple` |
-| `--osc` | auto | OSC category, e.g. `browning_apple` |
-| `--sample_rate` | `per_segment` | Or `per_second` — one call per second, much more expensive |
-| `--skip_states` | `background` | Comma-separated states not to caption; pass `''` to caption everything |
-| `--vlm_backend` | `claude` | `claude` \| `openai` \| `llava` |
-| `--vlm_model` | per-backend | Overrides the default model |
-| `--api_key` | env var | Else `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` |
-| `--max_tokens` | `80` | Per description |
-| `--dry_run` | off | Print segments without calling any VLM — **no extra deps needed** |
+| t=0–9s | `initial_state` | Shiny, deep red, firm, and whole. |
+| t=12–20s | `initial_state` | Whole, firm, glossy red apples; sliced half showing pale, crisp flesh. |
+| t=21s | `transitioning` | Oxidized, browning flesh; firm texture preserved. |
+| t=23–39s | `transitioning` | Sliced, pale, enzymatically browning at edges. |
 
-Default models: Claude `claude-haiku-4-5-20251001`, OpenAI `gpt-4o-mini`,
-LLaVA `llava-hf/llava-v1.6-mistral-7b-hf` (local, downloads ~15 GB on first run).
+The captions track the physical process in the right order — whole and glossy,
+then cut open with pale flesh exposed, then oxidizing at the edges. Neither
+component could produce this alone: VidOSC supplies the segmentation, the VLM
+supplies the description, and the object name (`apple`) is derived from the clip's
+parent directory so the prompt asks about the right thing.
 
-**Object name resolution**, in priority order: `--object` → `--osc` →
-the parent directory of `--video` (VidOSC's `<clip_dir>/<verb>_<object>/<file>.mp4`
-convention) → the filename stem, with a warning. If your clips aren't laid out
-that way, pass `--object` explicitly or you'll get a nonsense prompt.
+**Why the gaps?** Seconds 10–11 and 22 are missing because they were predicted
+`background`, and `--skip_states` defaults to `background` — captioning frames
+where nothing relevant is visible wastes API calls. Pass `--skip_states ''` to
+caption every segment.
 
-**Start with `--dry_run`.** It shows exactly which segments and frames would be
-sent, costs nothing, and needs no API key or extra packages.
+**Why two `initial_state` rows?** Segments break on any state change, so a
+background stretch between two initial-state spans splits them into separate
+rows. The segment boundaries reflect the raw prediction sequence, without
+smoothing.
 
----
-
-## Things you will need to change
-
-If you are not the original author, these are hardcoded and will not work for you
-as-is:
-
-- **W&B entity** — [run_inference.py:54](run_inference.py#L54) defaults to
-  `m22jeon-university-of-waterloo`, project `ChefOST`. Pass
-  `--wandb-entity <you> --wandb-project <yours>`, or edit those two constants.
-  `describe_states.py` imports the same defaults.
-- **W&B is on by default** whenever `WANDB_API_KEY` is in your environment, in
-  *both* scripts. If you have that variable set for unrelated reasons, every run
-  silently creates a run under the entity above. Pass `--no-wandb`, or unset it.
-- **State names assume 4 classes.** `STATE_NAMES` covers indices 0–3. The
-  multi-transition-state patch allows checkpoints with a larger vocab, but this
-  repo's printing and captioning code would need matching entries — a checkpoint
-  with `vocab_size > 4` raises `KeyError`. All three released checkpoints are
-  `vocab_size=4`, so this only bites if you train your own.
-
-### What's gitignored
-
-`checkpoints/`, `*.ckpt`, `data/`, `feats/`, `*.pth.tar`, `wandb/`, `.env`, and
-`/VidOSC/`. So a fresh clone has code only — you supply the model and the data.
+Each row logs the actual frame sent to the VLM, so you can check whether a poor
+caption came from a bad frame choice or a bad model response. `run_inference.py`
+logs a complementary view: per-second predictions with confidences, a
+state-duration bar chart, and a color-coded timeline image.
 
 ---
 
-## Troubleshooting
+## What the output is good for
 
-**`FileNotFoundError: VidOSC checkout not found at ...`**
-The sibling clone is missing or in the wrong place. Run `python vidosc_path.py`
-— the error message includes the exact clone commands for your paths. Set
-`$VIDOSC_ROOT` if your clone lives elsewhere.
+- **Structured recipe understanding.** Converting cooking video into a sequence
+  of "the object looked like *X* at time *T*" statements — the motivating use
+  case for the ChefOST project this feeds into.
+- **Grounding a language model in visual evidence.** The captions are anchored to
+  specific frames at specific times, rather than a summary of the whole video.
+- **Inspecting model behavior.** Reading captions at predicted boundaries is a
+  fast way to tell whether a transition was localized correctly, without opening
+  the video and scrubbing.
+- **Building comparison sets.** Because every run logs to W&B with its config,
+  runs across checkpoints, backends, and sampling rates stay comparable.
 
-**`... does not look like a VidOSC checkout -- missing model.py, task.py`**
-The directory exists but isn't upstream VidOSC (or the clone failed partway).
+---
 
-**`ModuleNotFoundError: No module named 'lookforthechange'`**
-The patches aren't applied. That import is Linux-only; the patch wraps it in a
-`try/except`. Re-run the `git apply` from step 1, or check with
-`git -C ../VidOSC apply --check patches/*.patch`.
+## Known limitations
 
-**`Feature dim 768 does not match checkpoint input_dim 1536`**
-Raised only when the dims are incompatible in a way padding can't fix. The
-ordinary 768→1536 case zero-pads with a warning instead — see
-[object-centric features](#object-centric-features-important).
+Be aware of these before trusting any numbers out of this pipeline.
 
-**`RuntimeError: Error(s) in loading state_dict`**
-The checkpoint's transformer config differs from the hardcoded one in
-`load_model` (4 heads, 3 layers, dim 512). Those match the released checkpoints;
-a checkpoint you trained with different hyperparameters needs them edited.
+**Feature mismatch.** [extract_features.py](extract_features.py) produces CLIP
+ViT-L/14 features, but the checkpoints were trained on InternVideo-MM-L14. Same
+architecture family and output dimension, different model — results are
+approximate.
 
-**`ffmpeg` errors from `extract_features.py`**
-`brew install ffmpeg` — the pip package `ffmpeg-python` is only a wrapper around
-the system binary.
+**Missing object-centric half.** All three released checkpoints expect 1536-dim
+input: whole-frame features concatenated with hand–object detector features.
+`extract_features.py` produces only the first 768 dims, and the rest gets
+zero-padded with a warning. Stacked on the point above, features you extract
+yourself are off on two axes at once. Use the pre-extracted `feats_handobj`
+files with `--obj_feat` for faithful results.
 
-**Predictions look like noise / all one state**
-Expected to some degree if you extracted features with `extract_features.py`:
-you're stacking a CLIP-for-InternVideo substitution on top of zero-padded
-object-centric features. Try a pre-extracted `feats_handobj` file with its
-`--obj_feat` pair to see what the checkpoint does when fed what it was trained on.
+**No temporal smoothing in this repo's output.** Single-second segments (like
+`t=21s` above) survive into the caption table as their own rows. VidOSC's
+ordering constraint applies during decoding, but nothing merges brief spurious
+runs afterward.
+
+**The VLM sees one frame per segment.** The middle frame stands in for the whole
+span. For a long segment where the object changes appreciably, that single frame
+may not be representative — `--sample_rate per_second` trades cost for
+resolution.
+
+**Captions are not verified.** The VLM describes what it sees in a frame it is
+*told* belongs to a given state. It will not push back if the state label is
+wrong, so a misclassified segment produces a confident, wrong-but-plausible
+description.
+
+---
+
+## Further reading
+
+- [INSTRUCTIONS.md](INSTRUCTIONS.md) — installation, commands, flags, troubleshooting
+- [patches/README.md](patches/README.md) — what's modified in upstream and why
+- [VidOSC paper](https://arxiv.org/abs/2312.11782) · [project page](https://vision.cs.utexas.edu/projects/VidOSC/)
+
+### Citation
+
+```bibtex
+@inproceedings{xue2024learning,
+  title     = {Learning Object State Changes in Videos: An Open-World Perspective},
+  author    = {Xue, Zihui and Ashutosh, Kumar and Grauman, Kristen},
+  booktitle = {CVPR},
+  year      = {2024}
+}
+```
